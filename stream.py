@@ -645,7 +645,7 @@ with st.container():
 
     with c3:
         charge_len_single = st.selectbox(
-                    "Charging hours",
+                    "Charging hours: (Single Selector)",
                     options=list(range(6, 13)),
                     index=2,  # default 8h
                 )
