@@ -6,9 +6,6 @@ from typing import Tuple
 import numpy as np
 import pandas as pd
 import streamlit as st
-
-import matplotlib as mpl
-import matplotlib.font_manager as fm
 import seaborn as sns
 
 # Plotly
