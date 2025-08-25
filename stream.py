@@ -14,6 +14,7 @@ import seaborn as sns
 # Plotly
 import plotly.express as px
 import plotly.io as pio
+import plotly.graph_objects as go
 
 # ---------------------------------------------
 # PAGE + THEME (Streamlit shell + CSS)
@@ -31,19 +32,19 @@ st.markdown("""
   border: 1px solid #2a2f3a;
   border-radius: 12px;
   padding: 16px;
-  text-align: center;           /* 👈 center everything inside */
+  text-align: center;
 }
 .metric-title {
   color: #9aa4b2;
   font-size: 0.9rem;
   margin-bottom: 6px;
-  text-align: center;           /* 👈 explicitly center text */
+  text-align: center;
 }
 .metric-value {
   color: #e8edf2;
   font-size: 1.6rem;
   font-weight: 700;
-  text-align: center;           /* 👈 explicitly center value */
+  text-align: center;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -178,19 +179,25 @@ def _best_windows_one_day_fixed(day_prices: np.ndarray,
         }
     return best
 
-
 def _year_factor_map(index_dates, perf_drop_rate_per_year=None, perf_multiplier_by_year=None):
-    years = pd.Index(pd.to_datetime(index_dates).year, name="year")
-    yrs_sorted = np.unique(years.values)
+    # Make it robust to Series or Index/array
+    dt = pd.to_datetime(index_dates, errors="coerce")
+    if isinstance(dt, pd.Series):
+        years_arr = dt.dt.year.to_numpy()
+    else:
+        years_arr = pd.Index(dt).year
+
+    yrs_sorted = np.unique(years_arr)
     if perf_multiplier_by_year is not None:
-        mp = pd.Series({y: float(perf_multiplier_by_year.get(y, 1.0)) for y in yrs_sorted}, name="perf_mult")
+        mp = pd.Series({int(y): float(perf_multiplier_by_year.get(int(y), 1.0)) for y in yrs_sorted},
+                       name="perf_mult")
     else:
         rate = float(perf_drop_rate_per_year) if perf_drop_rate_per_year else 0.0
         if rate <= 0:
-            mp = pd.Series({y: 1.0 for y in yrs_sorted}, name="perf_mult")
+            mp = pd.Series({int(y): 1.0 for y in yrs_sorted}, name="perf_mult")
         else:
-            y0 = yrs_sorted.min()
-            mp = pd.Series({y: (1.0 - rate) ** (y - y0) for y in yrs_sorted}, name="perf_mult")
+            y0 = int(yrs_sorted.min())
+            mp = pd.Series({int(y): (1.0 - rate) ** (int(y) - y0) for y in yrs_sorted}, name="perf_mult")
     return mp
 
 
@@ -216,7 +223,6 @@ def _choose_forced_shutdown_days(dates, extra_shutdowns_per_year=0, seed=None):
                 picks = rng.choice(year_days, size=n_pick, replace=False)
                 forced.update(pd.Timestamp(p) for p in picks)
     return forced
-
 
 def optimize_arbitrage_sweep(
     prices_df: pd.DataFrame,
@@ -366,7 +372,6 @@ def optimize_arbitrage_sweep(
         .reset_index()
     )
 
-    # We won't set opex here; we’ll compute proration downstream for scorecards & plots
     annual["opex_eur"] = 0.0
     annual["net_profit_eur"] = annual["gross_arbitrage_EUR"] - annual["opex_eur"]
 
@@ -385,6 +390,169 @@ def optimize_arbitrage_sweep(
                         ["year","charge_len","discharge_len"]
                      )
     return daily_all, hourly_all, annual
+
+# ---------------------------------------------
+# NAIVE BASELINE (fixed 06–18 charge, 18–06 discharge)
+# ---------------------------------------------
+def build_naive_fixed_windows(
+    prices_df: pd.DataFrame,
+    price_col: str = "Euro per MWh",
+    ts_col: str = "LocalDatetime",
+    capacity_mwh: float = 1.5,
+    date_start=None, date_end=None,
+    charge_start_hour: int = 6,
+    charge_len: int = 12,
+    perf_drop_rate_per_year: float | None = None,
+    perf_multiplier_by_year: dict | None = None,
+    extra_shutdowns_per_year: int | dict = 0,
+    rand_seed: int | None = 42,
+):
+    """
+    Baseline strategy:
+      - Charge on fixed window [charge_start_hour, charge_start_hour+charge_len)
+      - Discharge on remaining hours
+      - Capacity is split evenly across charge hours and discharge hours,
+        with optional performance degradation and forced shutdowns.
+    Returns (daily_df, hourly_df) in the SAME schema used by optimize_arbitrage_sweep.
+    """
+    if prices_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    df = prices_df.copy()
+    df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce")
+    df = df.dropna(subset=[ts_col, price_col]).sort_values(ts_col)
+
+    # Date filter
+    if date_start is not None:
+        df = df[df[ts_col] >= pd.to_datetime(date_start)]
+    if date_end is not None:
+        df = df[df[ts_col] <= pd.to_datetime(date_end)]
+    if df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    df["date"] = df[ts_col].dt.normalize()
+    df["hour"] = df[ts_col].dt.hour
+    df["price"] = df[price_col].astype(float).clip(lower=0)
+
+    # Per-year performance factor
+    perf_map = _year_factor_map(df["date"], perf_drop_rate_per_year, perf_multiplier_by_year)
+
+    # Forced shutdown days
+    forced_shutdown_dates = _choose_forced_shutdown_days(df["date"], extra_shutdowns_per_year, rand_seed)
+    forced_shutdown_dates = set(pd.Timestamp(d).normalize() for d in forced_shutdown_dates)
+
+    # Fixed windows
+    charge_hours = {(int(charge_start_hour) + i) % 24 for i in range(int(charge_len))}
+    discharge_len = 24 - int(charge_len)
+    discharge_start_hour = (int(charge_start_hour) + int(charge_len)) % 24
+
+    rows_hourly = []
+    rows_daily = []
+
+    # Build per-day
+    for day, grp in df.groupby(df["date"]):
+        day_ts = pd.Timestamp(day)
+        year = int(day_ts.year)
+        perf_mult = float(perf_map.loc[year]) if year in perf_map.index else 1.0
+        cap_eff = float(capacity_mwh) * perf_mult
+
+        # Determine if forced shutdown
+        is_forced = (day_ts in forced_shutdown_dates)
+
+        # Ensure all 24 hours are represented (fill if any hours missing)
+        prices_by_hour = grp.groupby("hour")["price"].mean().reindex(range(24), fill_value=np.nan)
+        # If a price is missing for an hour, skip energy/cashflow on that hour (treated as idle)
+        for hr in range(24):
+            price = float(prices_by_hour.iloc[hr]) if not pd.isna(prices_by_hour.iloc[hr]) else np.nan
+            role = "idle"
+            energy = 0.0
+            cash = 0.0
+
+            if not is_forced and not np.isnan(price):
+                if hr in charge_hours:
+                    role = "charge"
+                else:
+                    role = "discharge"
+
+            rows_hourly.append({
+                "date": day_ts, "hour": hr,
+                "price": (0.0 if np.isnan(price) else price),
+                "role": (role if not is_forced else "idle"),
+                "energy_mwh": 0.0,  # fill later after we know counts
+                "cashflow_eur": 0.0,
+                "shutdown": bool(is_forced),
+                "charge_len": int(charge_len),
+                "discharge_len": int(discharge_len),
+            })
+
+        # After roles assigned, compute split based on actual counts present
+        day_mask = [(r["date"] == day_ts) for r in rows_hourly]
+        day_rows_idx = [i for i, m in enumerate(day_mask) if m][-24:]  # last 24 we just appended
+        roles = [rows_hourly[i]["role"] for i in day_rows_idx]
+        prices = [rows_hourly[i]["price"] for i in day_rows_idx]
+
+        n_charge = sum(1 for r in roles if r == "charge")
+        n_discharge = sum(1 for r in roles if r == "discharge")
+
+        charge_rate = (cap_eff / n_charge) if n_charge > 0 else 0.0
+        discharge_rate = (cap_eff / n_discharge) if n_discharge > 0 else 0.0
+
+        daily_gross = 0.0
+        for i, idx in enumerate(day_rows_idx):
+            role = roles[i]
+            price = prices[i]
+            if np.isnan(price) or is_forced or role == "idle":
+                rows_hourly[idx]["energy_mwh"] = 0.0
+                rows_hourly[idx]["cashflow_eur"] = 0.0
+                continue
+            if role == "charge":
+                e = charge_rate
+                c = - price * e
+            else:  # discharge
+                e = discharge_rate
+                c = + price * e
+            rows_hourly[idx]["energy_mwh"] = e
+            rows_hourly[idx]["cashflow_eur"] = c
+            daily_gross += c
+
+        # Build daily row
+        # Average prices over roles (avoid divide-by-zero)
+        if n_charge > 0:
+            avg_charge = float(np.nanmean([p for p, r in zip(prices, roles) if r == "charge"]))
+        else:
+            avg_charge = None
+        if n_discharge > 0:
+            avg_discharge = float(np.nanmean([p for p, r in zip(prices, roles) if r == "discharge"]))
+        else:
+            avg_discharge = None
+
+        rows_daily.append({
+            "date": day_ts,
+            "shutdown": bool(is_forced),
+            "gross_arbitrage_EUR": float(0.0 if is_forced else daily_gross),
+            "avg_price_charge": avg_charge,
+            "avg_price_discharge": avg_discharge,
+            "charge_len": int(charge_len),
+            "discharge_len": int(discharge_len),
+            "charge_start_hour": int(charge_start_hour),
+            "discharge_start_hour": int(discharge_start_hour),
+            "best_charge_window": None,
+            "best_discharge_window": None,
+            "forced_shutdown": bool(is_forced),
+            "year": year
+        })
+
+    hourly_df = pd.DataFrame(rows_hourly).set_index(["date","hour"]).sort_index()
+    hourly_df = hourly_df[["price","role","energy_mwh","cashflow_eur","shutdown","charge_len","discharge_len"]]
+
+    daily_df = pd.DataFrame(rows_daily).set_index("date").sort_index()
+    daily_df = daily_df[[
+        "shutdown","gross_arbitrage_EUR","avg_price_charge","avg_price_discharge",
+        "charge_len","discharge_len","charge_start_hour","discharge_start_hour",
+        "best_charge_window","best_discharge_window","year","forced_shutdown"
+    ]]
+
+    return daily_df, hourly_df
 
 # ---------------------------------------------
 # HELPERS: OPEX PRORATION + PLOT DATA
@@ -413,7 +581,6 @@ def build_annual_gross(daily_df: pd.DataFrame) -> pd.DataFrame:
            .groupby(["year","scenario"], as_index=False)["gross_arbitrage_EUR"].sum()
            .rename(columns={"gross_arbitrage_EUR":"gross"}))
     return out
-
 
 def days_in_year(y: int) -> int:
     return 366 if pd.Timestamp(f"{y}-12-31").is_leap_year else 365
@@ -474,7 +641,6 @@ def build_cumsum_with_opex_df(daily_df: pd.DataFrame, opex_year: float) -> pd.Da
                 opex = opex_year
                 target = pd.Timestamp(f"{y}-12-31")
                 if target not in s.index:
-                    # if no 31/12 datapoint, use last available date in that year
                     yr_mask = s.index.year == y
                     if not yr_mask.any():
                         continue
@@ -532,9 +698,8 @@ def build_annual_prorated_net(daily_df: pd.DataFrame, opex_year: float) -> pd.Da
         for y in years:
             gross = df_s.loc[df_s.index.year == y, "gross_arbitrage_EUR"].sum()
             if y < last_year:
-                opex = float(opex_year)  # completed year
+                opex = float(opex_year)
             else:
-                # prorate by elapsed days in the final year
                 yr_dates = dates[dates.year == y]
                 if len(yr_dates) == 0:
                     continue
@@ -552,12 +717,7 @@ def build_annual_prorated_net(daily_df: pd.DataFrame, opex_year: float) -> pd.Da
             })
     return pd.DataFrame(rows)
 
-
 def plot_yearly_net_stacked_mpl(df_yearly: pd.DataFrame, ax=None, title="Yearly Net Profit (stacked)"):
-    """
-    Alternate 'different look' version using Matplotlib/Seaborn (not Plotly).
-    Stacks scenarios horizontally per year.
-    """
     import matplotlib.pyplot as plt
     if ax is None:
         fig, ax = plt.subplots(figsize=(7, 5))
@@ -569,7 +729,6 @@ def plot_yearly_net_stacked_mpl(df_yearly: pd.DataFrame, ax=None, title="Yearly 
 
     years = sorted(df_yearly["year"].unique())
     scenarios = sorted(df_yearly["scenario"].unique())
-    # build matrix [len(years) x len(scenarios)]
     data = np.array([
         [df_yearly[(df_yearly["year"] == y) & (df_yearly["scenario"] == s)]["net"].sum()
          for s in scenarios]
@@ -587,16 +746,53 @@ def plot_yearly_net_stacked_mpl(df_yearly: pd.DataFrame, ax=None, title="Yearly 
     ax.legend(title="Scenario", bbox_to_anchor=(1.02, 1), loc="upper left")
     return ax
 
-
+def _season_from_month(m: int) -> str:
+    # Northern hemisphere seasons (ES, DE, FI, FR, NL)
+    if m in (12, 1, 2):  return "Winter"
+    if m in (3, 4, 5):   return "Spring"
+    if m in (6, 7, 8):   return "Summer"
+    return "Autumn"
 
 # ---------------------------------------------
 # UI – Controls
 # ---------------------------------------------
 st.title("⚡ Earnings Potentials — Results Explorer")
 
+
+@st.cache_data(show_spinner=False)
+def load_prices_full() -> pd.DataFrame:
+    """
+    Return a DataFrame with ['LocalDatetime','Euro per MWh','Country'] plus
+    derived columns: Hour, Day, Month, Year, Season.
+    Clips only the UPPER bound to CUTOFF_END so we can include pre-2022 history.
+    """
+    df = pd.read_parquet("bidding_zone_prices.parquet")
+    df = df[['LocalDatetime','Euro per MWh','Country']]
+    df["LocalDatetime"] = pd.to_datetime(df["LocalDatetime"], errors="coerce")
+    df = df.dropna(subset=["LocalDatetime", "Euro per MWh"])
+
+    # Keep only known countries (same keep-list)
+    keep = ["ES", "FI", "NL", "DE", "FR"]
+    if "Country" in df.columns:
+        df = df[df["Country"].isin(keep)]
+
+    # Clip only the TOP end so we retain pre-2022 data
+    df = df[df["LocalDatetime"] <= CUTOFF_END]
+
+    # --- Derived columns ---
+    dt = df["LocalDatetime"].dt
+    df["Hour"]  = dt.hour
+    df["Day"]   = dt.day
+    df["Month"] = dt.month
+    df["Year"]  = dt.year
+    df["Season"] = dt.month.map(_season_from_month)  # uses your helper from above
+
+    return df
+
+
+
 with st.container():
-    # 3 columns: Filters & dates | Asset & economics | Windows & action
-    c1, c2, c3, c4 = st.columns([1, 1, 1,1 ])
+    c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
 
     # --- Column 1: Country + Dates ---
     with c1:
@@ -608,7 +804,8 @@ with st.container():
         country = st.selectbox(
             "Country",
             countries,
-            index=0,
+            index=1,
+            key="country_filter",
             help="DE - Germany, ES - Spain, FI - Finland, FR - France, NL - Netherlands",
         )
 
@@ -616,7 +813,7 @@ with st.container():
         daterange = st.date_input(
             "Date range",
             value=(date(2022, 1, 1), date(2025, 8, 11)),
-            min_value=date(2015, 1, 1),
+            min_value=date(2012, 1, 1),
             max_value=date(2025, 8, 11),
             help="Available Data: 01/01/2022 - 11/08/2025",
         )
@@ -624,7 +821,6 @@ with st.container():
             pd.to_datetime(daterange[0]),
             pd.to_datetime(daterange[1]),
         ) if isinstance(daterange, tuple) else (pd.to_datetime(daterange), None)
-
 
     # --- Column 2: Battery & economics ---
     with c2:
@@ -643,39 +839,34 @@ with st.container():
             help="Fractional; e.g., 0.01 = 1%/yr",
         )
 
+    # --- Column 3: Windows ---
     with c3:
         charge_len_single = st.selectbox(
-                    "Charging hours: (Single Selector)",
-                    options=list(range(6, 13)),
-                    index=2,  # default 8h
-                )
+            "Charging hours (optimized)",
+            options=list(range(6, 13)),
+            index=2,  # default 8h
+        )
         discharge_min, discharge_max = st.select_slider(
-                    "Discharge window (hours)",
-                    options=list(range(6, 13)),
-                    value=(6, 12),
-                )
+            "Discharge window (hours, optimized)",
+            options=list(range(6, 13)),
+            value=(6, 12),
+        )
 
-
-    # --- Column 3: Windows & action ---
+    # --- Column 4: OPEX + forced + run ---
     with c4:
         opex_year = st.number_input(
-                    "OPEX per year (EUR)",
-                    min_value=0.0,
-                    value=5000.0,
-                    step=500.0,
-                )
-
+            "OPEX per year (EUR)",
+            min_value=0.0,
+            value=1500.0,
+            step=500.0,
+        )
         forced_shutdowns = st.number_input(
-                    "Extra shutdowns per year",
-                    min_value=0,
-                    value=0,
-                    step=1,
-                )
-        # Run button at the bottom of col 3
+            "Extra shutdowns per year",
+            min_value=0,
+            value=0,
+            step=1,
+        )
         run_btn = st.button("🚀 Run the model", use_container_width=True, type="primary")
-
-st.divider()
-
 
 st.divider()
 
@@ -684,142 +875,743 @@ st.divider()
 # ---------------------------------------------
 daily_all = hourly_all = annual = pd.DataFrame()
 
-if run_btn:
-    if prices_df.empty:
-        st.warning("No data loaded. Replace load_prices() with your real data.")
-    else:
-        df_use = prices_df[prices_df["Country"] == country].copy()
 
-        def run_optimizer(df_use) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-            daily_all, hourly_all, annual = optimize_arbitrage_sweep(
-                df_use,
-                price_col="Euro per MWh",
-                ts_col="LocalDatetime",
-                capacity_mwh=capacity_mwh,
-                date_start=date_start, date_end=date_end,
-                charge_len_options=[int(charge_len_single)],                 # single charging hours
-                discharge_len_options=range(int(discharge_min), int(discharge_max)+1),
-                perf_drop_rate_per_year=perf_drop if perf_drop > 0 else None,
-                extra_shutdowns_per_year=int(forced_shutdowns),
-                opex_by_year=None,     # we'll handle OPEX downstream
+tab1, tab2 = st.tabs(["📊 Tab 1: Scenarios Explorer", "📈 Tab 2: Price Analysis"])
+
+with tab1:
+
+    if run_btn:
+        if prices_df.empty:
+            st.warning("No data loaded. Replace load_prices() with your real data.")
+        else:
+            df_use = prices_df[prices_df["Country"] == country].copy()
+
+            def run_optimizer(df_use) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+                daily_all, hourly_all, annual = optimize_arbitrage_sweep(
+                    df_use,
+                    price_col="Euro per MWh",
+                    ts_col="LocalDatetime",
+                    capacity_mwh=capacity_mwh,
+                    date_start=date_start, date_end=date_end,
+                    charge_len_options=[int(charge_len_single)],  # single charging hours
+                    discharge_len_options=range(int(discharge_min), int(discharge_max)+1),
+                    perf_drop_rate_per_year=perf_drop if perf_drop > 0 else None,
+                    extra_shutdowns_per_year=int(forced_shutdowns),
+                    opex_by_year=None,     # OPEX handled downstream
+                )
+                return daily_all, hourly_all, annual
+
+            with st.spinner("Running optimization…"):
+                daily_all, hourly_all, annual = run_optimizer(df_use)
+
+                # --- Naive baseline ---
+                daily_naive, hourly_naive = build_naive_fixed_windows(
+                    df_use,
+                    price_col="Euro per MWh",
+                    ts_col="LocalDatetime",
+                    capacity_mwh=capacity_mwh,
+                    date_start=date_start, date_end=date_end,
+                    charge_start_hour=6,
+                    charge_len=12,  # 06–18 charge
+                    perf_drop_rate_per_year=perf_drop if perf_drop > 0 else None,
+                    extra_shutdowns_per_year=int(forced_shutdowns),
+                    rand_seed=42,
+                )
+
+                # Merge results (always run; used for comparison in charts)
+                if not daily_naive.empty:
+                    daily_all = pd.concat([daily_all, daily_naive], axis=0).sort_index() if not daily_all.empty else daily_naive
+                    hourly_all = pd.concat([hourly_all, hourly_naive], axis=0).sort_index() if not hourly_all.empty else hourly_naive
+
+                # Optional: flip natural shutdowns off (keep days even if profit==0)
+                allow_neg_days = False
+                if allow_neg_days and not daily_all.empty:
+                    natural_mask = (daily_all["shutdown"] == True) & (~daily_all["forced_shutdown"])
+                    daily_all.loc[natural_mask, "shutdown"] = False
+
+    # ---------------------------------------------
+    # RESULTS — show only after clicking "Run the model"
+    # ---------------------------------------------
+    if run_btn and not daily_all.empty:
+        # --- SCORECARDS (Avg days, Max revenue, Avg OPEX with proration, Net) ---
+        days_per_scen = daily_all.groupby(["charge_len","discharge_len"]).size()
+        avg_days = int(days_per_scen.mean()) if len(days_per_scen) else 0
+
+        scen_revenue = daily_all.groupby(["charge_len","discharge_len"])["gross_arbitrage_EUR"].sum()
+        if not scen_revenue.empty:
+            max_revenue = float(scen_revenue.max())
+            winner = scen_revenue.idxmax()  # (Lc, Ld)
+            winner_label = f"{winner[0]}c-{winner[1]}d"
+            if winner_label == "12c-12d":
+                winner_label = "12c-12d (Naive)"
+        else:
+            max_revenue, winner_label = 0.0, "—"
+
+        opex_per_scen = compute_prorated_opex_per_scenario(daily_all, float(opex_year))
+        avg_opex = float(opex_per_scen.mean()) if not opex_per_scen.empty else 0.0
+        net_profit = max_revenue - avg_opex
+
+        colA, colB, colC, colD = st.columns(4)
+
+        def card(col, title, value):
+            col.markdown(
+                f"""
+                <div class="metric-card">
+                <div class="metric-title">{title}</div>
+                <div class="metric-value">{value}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
             )
-            return daily_all, hourly_all, annual
 
-        with st.spinner("Running optimization…"):
-            daily_all, hourly_all, annual = run_optimizer(df_use)
+        card(colA, "Avg. Days per Scenario", f"{avg_days:,}")
+        card(colB, f"Max Revenue ({winner_label})", f"€ {max_revenue:,.0f}")
+        card(colC, "Total OPEX", f"€ {avg_opex:,.0f}")
+        card(colD, "Net Profit (Max – Avg OPEX)", f"€ {net_profit:,.0f}")
 
-            # Optional: flip natural shutdowns off (keep days even if profit==0)
+        st.divider()
 
-            allow_neg_days = False
-            if allow_neg_days and not daily_all.empty:
-                natural_mask = (daily_all["shutdown"] == True) & (~daily_all["forced_shutdown"])
-                daily_all.loc[natural_mask, "shutdown"] = False
+        # --- CHARTS: Left = Cumsum | Right = Yearly ---
+        st.subheader("Charts")
 
-# ---------------------------------------------
-# SCORECARDS (Avg days, Max revenue, Avg OPEX with proration, Net)
-# ---------------------------------------------
-if not daily_all.empty:
-    # Avg number of days across scenarios
-    days_per_scen = daily_all.groupby(["charge_len","discharge_len"]).size()
-    avg_days = int(days_per_scen.mean()) if len(days_per_scen) else 0
+        st.markdown("""
+        <div style="background-color:#2b2b2b; padding:12px; border-radius:8px; border: 1px solid #444;">
+        <b>Important notes:</b>
+        <ul>
+            <li>2025 data until 11 of August.</li>
+            <li>Optimization searches best daily charge/discharge windows; the Naive baseline is fixed 06–18 charge / 18–06 discharge.</li>
+            <li>OPEX is added every last day of the period to see the real effect.</li>
+            <li>2022: Price crisis in European Countries (Ukraine/Russia War and Post-Covid).</li>
+        </ul>
+        </div>
+        """, unsafe_allow_html=True)
 
-    # Max revenue & winning scenario
-    scen_revenue = daily_all.groupby(["charge_len","discharge_len"])["gross_arbitrage_EUR"].sum()
-    if not scen_revenue.empty:
-        max_revenue = float(scen_revenue.max())
-        winner = scen_revenue.idxmax()  # (Lc, Ld)
-        winner_label = f"{winner[0]}c-{winner[1]}d"
-    else:
-        max_revenue, winner_label = 0.0, "—"
+        left, right = st.columns([2, 1])
+        with left:
+            st.subheader("Earnings Potentials by Scenarios (OPEX applied at period-end)")
+            cumsum_df = build_cumsum_with_opex_df(daily_all, float(opex_year))
+            if not cumsum_df.empty:
+                cumsum_df = cumsum_df.copy()
+                # Always show Naive and give it a friendly label
+                cumsum_df["scenario"] = cumsum_df["scenario"].replace({"12c-12d": "12c-12d (Naive)"})
+                fig = px.line(
+                    cumsum_df, x="date", y="cumsum", color="scenario",
+                    color_discrete_sequence=company_colors,
+                    labels={"date":"Date","cumsum":"Cumulative profit [EUR]","scenario":"Scenario"}
+                )
+                # Force Naive line style (white)
+                for trace in fig.data:
+                    if trace.name == "12c-12d (Naive)":
+                        trace.line.color = "white"
+                fig.update_layout(margin=dict(l=10, r=10, t=10, b=10))
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("No data to plot.")
 
-    # Avg OPEX across scenarios with end-of-year proration
-    opex_per_scen = compute_prorated_opex_per_scenario(daily_all, float(opex_year))
-    avg_opex = float(opex_per_scen.mean()) if not opex_per_scen.empty else 0.0
+        with right:
+            st.subheader("Yearly Net Profit (€) by Scenario")
+            yearly_df = build_annual_prorated_net(daily_all, float(opex_year))
+            if not yearly_df.empty:
+                yearly_df = yearly_df.copy()
+                # Friendly label for the baseline
+                yearly_df["scenario"] = yearly_df["scenario"].replace({"12c-12d": "12c-12d (Naive)"})
 
-    net_profit = max_revenue - avg_opex
+                # Round NET to 2 decimals for plotting & labels
+                yearly_df["net"] = yearly_df["net"].astype(float).round(2)
 
-    colA, colB, colC, colD = st.columns(4)
+                fig2 = px.bar(
+                    yearly_df,
+                    x="net",
+                    y="year",
+                    color="scenario",
+                    orientation="h",
+                    barmode="group",
+                    text=yearly_df["net"],                 # we’ll format this below
+                    color_discrete_sequence=company_colors,
+                    labels={"net": "Net Profit (€)", "year": "Year", "scenario": "Scenario"},
+                    title=""
+                )
 
-    def card(col, title, value):
-        col.markdown(
-            f"""
-            <div class="metric-card">
-              <div class="metric-title">{title}</div>
-              <div class="metric-value">{value}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
+                # Force Naive color to white
+                for trace in fig2.data:
+                    if trace.name == "12c-12d (Naive)":
+                        trace.marker.color = "white"
+
+                # Format bar labels to € and 2 decimals; nicer hover; axis ticks to 2 decimals + €
+                fig2.update_traces(
+                    texttemplate="€ %{x:,.2f}",
+                    textposition="outside",
+                    hovertemplate="<b>Year:</b> %{y}<br><b>Scenario:</b> %{fullData.name}"
+                                "<br><b>Net:</b> € %{x:,.2f}<extra></extra>"
+                )
+
+                # Let text hang outside the bars without being clipped
+                fig2.update_traces(cliponaxis=False)
+
+                # Add space at the end so all labels are visible
+                x_max = float(yearly_df["net"].max() + 5000)
+                x_min = float(yearly_df["net"].min())
+                span = (x_max - x_min) if x_max != x_min else max(abs(x_max), 1.0)
+                pad  = 0.10 * span  # 10% padding on both sides
+
+                fig2.update_xaxes(range=[x_min - pad, x_max + pad])
+
+                fig2.update_layout(
+                    yaxis=dict(type="category"),
+                    xaxis=dict(tickformat=",.2f", tickprefix="€ ", separatethousands=True),
+                    margin=dict(l=10, r=10, t=10, b=10),
+                )
+
+                st.plotly_chart(fig2, use_container_width=True)
+            else:
+                st.info("No yearly data available for the selected filters.")
+
+        # ---------------------------------------------
+        # DISTRIBUTIONS — Optimized only (no bandwidth control)
+        # ---------------------------------------------
+        def kde_curve(values: np.ndarray, xmin=0.0, xmax=23.0, step=0.1):
+            """Gaussian KDE with Silverman's bandwidth; returns (xs, density)."""
+            values = np.asarray(values, dtype=float)
+            values = values[~np.isnan(values)]
+            n = len(values)
+            xs = np.arange(xmin, xmax + step, step)
+            if n == 0:
+                return xs, np.zeros_like(xs)
+            std = np.std(values) if np.std(values) > 0 else 1.0
+            h = 1.06 * std * (n ** (-1/5))
+            h = max(h, 0.3)  # floor to avoid overly spiky curves
+            diffs = (xs[:, None] - values[None, :]) / h
+            dens = np.exp(-0.5 * diffs**2).sum(axis=1) / (n * h * np.sqrt(2*np.pi))
+            return xs, dens
+
+        # Base DF, exclude Naive (12c-12d) and shutdown days
+        dist_df = (
+            daily_all.reset_index().rename(columns={"index":"date"})
+            .query("shutdown == False")
+            .copy()
+        )
+        dist_df["Scenario"] = dist_df["charge_len"].astype(int).astype(str) + "c-" + dist_df["discharge_len"].astype(int).astype(str) + "d"
+        dist_df = dist_df[dist_df["Scenario"] != "12c-12d"]
+
+        # ---------- Section: by Season ----------
+        st.divider()
+        st.subheader("Start Hour Distributions — by Season (Optimized only)")
+
+        df_season = dist_df.copy()
+        df_season["Season"] = df_season["date"].dt.month.apply(_season_from_month)
+        season_order = ["Winter","Spring","Summer","Autumn"]
+        df_season["Season"] = pd.Categorical(df_season["Season"], categories=season_order, ordered=True)
+
+        s_left, s_right = st.columns(2)
+
+        with s_left:
+            st.markdown("**Charge start hour**")
+            fig_s_c = px.histogram(
+                df_season,
+                x="charge_start_hour",
+                color="Season",
+                barmode="overlay",
+                nbins=24,
+                histnorm="probability density",
+                category_orders={"Season": season_order},
+                color_discrete_sequence=company_colors,
+                labels={"charge_start_hour":"Hour of day (0–23)"}
+            )
+            fig_s_c.update_traces(opacity=0.45)
+            fig_s_c.update_layout(bargap=0.1, xaxis=dict(dtick=2, range=[0,23]), yaxis_title="Density")
+            # KDE overlays
+            for i, sname in enumerate(season_order):
+                vals = df_season.loc[df_season["Season"] == sname, "charge_start_hour"].to_numpy()
+                xs, ys = kde_curve(vals)
+                fig_s_c.add_trace(go.Scatter(x=xs, y=ys, mode="lines", name=f"{sname} KDE",
+                                            line=dict(width=2, color=company_colors[i % len(company_colors)])))
+            st.plotly_chart(fig_s_c, use_container_width=True)
+
+        with s_right:
+            st.markdown("**Discharge start hour**")
+            fig_s_d = px.histogram(
+                df_season,
+                x="discharge_start_hour",
+                color="Season",
+                barmode="overlay",
+                nbins=24,
+                histnorm="probability density",
+                category_orders={"Season": season_order},
+                color_discrete_sequence=company_colors,
+                labels={"discharge_start_hour":"Hour of day (0–23)"}
+            )
+            fig_s_d.update_traces(opacity=0.45)
+            fig_s_d.update_layout(bargap=0.1, xaxis=dict(dtick=2, range=[0,23]), yaxis_title="Density")
+            for i, sname in enumerate(season_order):
+                vals = df_season.loc[df_season["Season"] == sname, "discharge_start_hour"].to_numpy()
+                xs, ys = kde_curve(vals)
+                fig_s_d.add_trace(go.Scatter(x=xs, y=ys, mode="lines", name=f"{sname} KDE",
+                                            line=dict(width=2, color=company_colors[i % len(company_colors)])))
+            st.plotly_chart(fig_s_d, use_container_width=True)
+
+        # ---------- Section: by Model/Scenario ----------
+        st.divider()
+        st.subheader("Start Hour Distributions — by Model/Scenario (Optimized only)")
+
+        scen_order = sorted(
+            dist_df["Scenario"].unique(),
+            key=lambda s: (int(s.split('c-')[0]), int(s.split('c-')[1].rstrip('d')))
+        )
+        dist_df["Scenario"] = pd.Categorical(dist_df["Scenario"], categories=scen_order, ordered=True)
+
+        m_left, m_right = st.columns(2)
+
+        with m_left:
+            st.markdown("**Charge start hour**")
+            fig_m_c = px.histogram(
+                dist_df,
+                x="charge_start_hour",
+                color="Scenario",
+                barmode="overlay",
+                nbins=24,
+                histnorm="probability density",
+                category_orders={"Scenario": scen_order},
+                color_discrete_sequence=company_colors,
+                labels={"charge_start_hour":"Hour of day (0–23)"}
+            )
+            fig_m_c.update_traces(opacity=0.45)
+            fig_m_c.update_layout(bargap=0.1, xaxis=dict(dtick=2, range=[0,23]), yaxis_title="Density")
+            for i, scen in enumerate(scen_order):
+                vals = dist_df.loc[dist_df["Scenario"] == scen, "charge_start_hour"].to_numpy()
+                xs, ys = kde_curve(vals)
+                fig_m_c.add_trace(go.Scatter(x=xs, y=ys, mode="lines", name=f"{scen} KDE",
+                                            line=dict(width=2, color=company_colors[i % len(company_colors)])))
+            st.plotly_chart(fig_m_c, use_container_width=True)
+
+        with m_right:
+            st.markdown("**Discharge start hour**")
+            fig_m_d = px.histogram(
+                dist_df,
+                x="discharge_start_hour",
+                color="Scenario",
+                barmode="overlay",
+                nbins=24,
+                histnorm="probability density",
+                category_orders={"Scenario": scen_order},
+                color_discrete_sequence=company_colors,
+                labels={"discharge_start_hour":"Hour of day (0–23)"}
+            )
+            fig_m_d.update_traces(opacity=0.45)
+            fig_m_d.update_layout(bargap=0.1, xaxis=dict(dtick=2, range=[0,23]), yaxis_title="Density")
+            for i, scen in enumerate(scen_order):
+                vals = dist_df.loc[dist_df["Scenario"] == scen, "discharge_start_hour"].to_numpy()
+                xs, ys = kde_curve(vals)
+                fig_m_d.add_trace(go.Scatter(x=xs, y=ys, mode="lines", name=f"{scen} KDE",
+                                            line=dict(width=2, color=company_colors[i % len(company_colors)])))
+            st.plotly_chart(fig_m_d, use_container_width=True)
+        # ---------------------------------------------
+        # Tab 1 — Intraday deviation heatmap (PX, PeriodIndex-safe)
+        # ---------------------------------------------
+        st.divider()
+        st.subheader("Intraday Price Deviation from Monthly Average (2022–present)")
+
+        df_heat = prices_df.copy()
+        df_heat = df_heat[(df_heat["Country"] == country) &
+                        (df_heat["LocalDatetime"] >= pd.Timestamp("2022-01-01"))]
+        if date_end is not None:
+            df_heat = df_heat[df_heat["LocalDatetime"] <= pd.to_datetime(date_end)]
+
+        if df_heat.empty:
+            st.info("No data available for the selected filters.")
+        else:
+            # Features
+            df_heat["MonthYear"] = df_heat["LocalDatetime"].dt.to_period("M")
+            df_heat["Hour"]      = df_heat["LocalDatetime"].dt.hour
+
+            # Hourly mean per Month-Year
+            hourly_mm = (
+                df_heat.groupby(["MonthYear","Hour"])["Euro per MWh"]
+                    .mean()
+                    .rename("Euro_per_MWh_hourly")
+                    .reset_index()
+            )
+
+            # Monthly mean, then deviation (hourly - monthly)
+            hourly_mm["Euro_per_MWh_monthly"] = (
+                hourly_mm.groupby("MonthYear")["Euro_per_MWh_hourly"].transform("mean")
+            )
+            hourly_mm["Hour_minus_Month_Avg"] = np.round(
+                hourly_mm["Euro_per_MWh_hourly"] - hourly_mm["Euro_per_MWh_monthly"], 0
+            )
+
+            # Pivot; ensure 0..23 present; sort chronologically
+            pivot = hourly_mm.pivot(index="MonthYear", columns="Hour", values="Hour_minus_Month_Avg")
+            pivot = pivot.reindex(columns=range(24))
+            pivot.index = pivot.index.astype("period[M]").sort_values()
+        # ---- Build inputs safe for Plotly JSON ----
+        Z = pivot.to_numpy()
+        y_labels = [str(p) for p in pivot.index]      # 'YYYY-MM'
+        x_labels = [str(h) for h in pivot.columns]    # '0'..'23'
+
+        # Symmetric range so 0 sits in the center
+        vmax = float(np.nanmax(np.abs(Z))) if np.isfinite(Z).any() else 1.0
+
+        # Diverging scale with white midpoint
+        colorscale = [
+            [0.00, company_colors[2]],
+            [0.37, company_colors[3]],
+            [0.50, "#f0f2f1"],   # white-ish midpoint
+            [0.63, company_colors[5]],
+            [1.00, company_colors[4]],
+        ]
+
+        # Height scales with number of months (≈ row count)
+        height_px = max(700, 26 * len(y_labels))
+
+        fig_hm = px.imshow(
+            Z,
+            x=x_labels,
+            y=y_labels,
+            color_continuous_scale=colorscale,
+            zmin=-vmax, zmax=vmax,         # center around 0
+            aspect="auto",
+            labels=dict(color="€/MWh vs monthly avg", x="Hour of day", y="Month–Year"),
+            title=f"{country} — Intraday Price Deviation from Monthly Average (2022–{int(df_heat['LocalDatetime'].dt.year.max())})"
         )
 
-    card(colA, "Total Days", f"{avg_days:,}")
-    card(colB, f"Max Revenue ({winner_label})", f"€ {max_revenue:,.0f}")
-    card(colC, "Total OPEX", f"€ {avg_opex:,.0f}")
-    card(colD, "Net Profit (Max – Avg OPEX)", f"€ {net_profit:,.0f}")
+        # --- Annotations (numbers in each cell) ---
+        # Round to integers and hide NaNs
+        Z_round = np.where(np.isfinite(Z), np.round(Z).astype(int), np.nan)
+        text = [[("" if not np.isfinite(val) else f"{int(val)}") for val in row] for row in Z_round]
 
-    st.divider()
+        fig_hm.update_traces(
+            text=text,
+            texttemplate="%{text}",
+            textfont=dict(size=10)
+        )
 
-# ---------------------------------------------
-# PLOTS (Plotly Express)
-# ---------------------------------------------
+        # Cosmetics
+        fig_hm.update_layout(
+            margin=dict(l=10, r=10, t=60, b=10),
+            title_x=0,
+            coloraxis_colorbar=dict(ticksuffix=" €"),
+            height=height_px
+        )
+        fig_hm.update_xaxes(dtick=1)
 
-if not daily_all.empty:
+        import calendar
 
-    st.subheader("Charts")
+        # Pretty month labels like "January - 2023"
+        y_display = [f"{calendar.month_name[p.month]} - {p.year}" for p in pivot.index]
 
-    st.markdown("""
-    <div style="background-color:#2b2b2b; padding:12px; border-radius:8px; border: 1px solid #444;">
-    <b>Important notes:</b>
-    <ul>
-    <li>2025 data until 11 of August.</li>
-    <li>Naive model: 12 hours of Charging and Discharging (C: 6 AM – 5 PM, D: 6 PM – 5 AM).</li>
-    <li>OPEX is added every last day of the period to see the real effect.</li>
-    <li>2022: Price crisis in European Countries (Ukraine/Russia War and Post-Covid).</li>
-    </ul>
-    </div>
-    """, unsafe_allow_html=True)
+        fig_hm.update_yaxes(
+            type="category",
+            categoryorder="array",
+            categoryarray=y_labels,   # keep chronological order
+            tickmode="array",
+            tickvals=y_labels,        # every row (the underlying categories)
+            ticktext=y_display,       # shown text: "MMMM - YYYY"
+            autorange="reversed",
+            automargin=True,
+            tickfont=dict(size=10)
+        )
 
-    left, right = st.columns([2, 1])
-    with left:
-        st.subheader("Earnings Potentials by Scenarios (OPEX applied at period-end)")
-        cumsum_df = build_cumsum_with_opex_df(daily_all, float(opex_year))
-        if not cumsum_df.empty:
-            fig = px.line(
-                cumsum_df, x="date", y="cumsum", color="scenario",
-                color_discrete_sequence=company_colors,
-                labels={"date":"Date","cumsum":"Cumulative profit [EUR]","scenario":"Scenario"}
+        st.plotly_chart(fig_hm, use_container_width=True)
+
+    elif run_btn:
+        st.info("No results to display. Check data filters and try again.")
+
+with tab2:
+    st.title("📈 Price Analysis:")
+
+    df_full = load_prices_full()
+    if df_full.empty:
+        st.info("No data available to display.")
+    else:
+        # Use the country selected in Tab 1; fallback to first available just in case
+        selected_country = st.session_state.get("country_filter")
+        if selected_country is None or selected_country not in df_full["Country"].unique():
+            selected_country = sorted(df_full["Country"].dropna().unique().tolist())[0]
+
+        # Small badge to show which country is active (no extra selectbox)
+        st.markdown(f"**Country:** `{selected_country}`")
+
+        st.markdown("""
+        <div style="background-color:#2b2b2b; padding:12px; border-radius:8px; border: 1px solid #444;">
+        <b>Electricity prices: a shifting intraday pattern:</b>
+        <ul>
+            <li>Europe’s 24-hour price profile has changed markedly with the rapid build-out of renewables and the energy shock following Russia’s invasion of Ukraine. Since 2022, average prices are generally higher, yet midday hours increasingly cluster near €0/MWh when solar output is abundant. Pre-2022, the lowest prices typically appeared overnight; today, the trough more often occurs between ~10:00 and 15:00. The magnitude of this shift varies by country and season (weather conditions), reflecting each system’s generation mix and interconnections.</li>
+
+        """, unsafe_allow_html=True)
+
+        df_c = df_full[df_full["Country"] == selected_country].copy()
+
+        left_col, right_col = st.columns(2)
+
+        # Left: BEFORE 2022-01-01
+        with left_col:
+            st.subheader("Average Intraday Profile by Season — **Before 2022**")
+            df_pre = df_c[df_c["LocalDatetime"] < pd.Timestamp("2022-01-01")]
+            if df_pre.empty:
+                st.info("No pre-2022 data for the selected country.")
+            else:
+                agg_pre = (
+                    df_pre.groupby(["Season", "Hour"], as_index=False)["Euro per MWh"]
+                    .mean()
+                    .sort_values(["Season", "Hour"])
+                )
+                fig_pre = px.line(
+                    agg_pre,
+                    x="Hour",
+                    y="Euro per MWh",
+                    color="Season",
+                    markers=True,
+                    color_discrete_sequence=company_colors,
+                    labels={"Hour":"Hour of day", "Euro per MWh":"€/MWh"},
+                    title=f"{selected_country} — Average Intraday Profile by Season (≤ 2021)"
+                )
+                fig_pre.update_layout(margin=dict(l=10, r=10, t=40, b=10), xaxis=dict(dtick=2, range=[0, 23]))
+                st.plotly_chart(fig_pre, use_container_width=True)
+
+        # Right: FROM 2022-01-01
+        with right_col:
+            st.subheader("Average Intraday Profile by Season — **From 2022**")
+            df_post = df_c[df_c["LocalDatetime"] >= pd.Timestamp("2022-01-01")]
+            if df_post.empty:
+                st.info("No 2022+ data for the selected country.")
+            else:
+                agg_post = (
+                    df_post.groupby(["Season", "Hour"], as_index=False)["Euro per MWh"]
+                    .mean()
+                    .sort_values(["Season", "Hour"])
+                )
+                y_min = int(df_post["Year"].min())
+                y_max = int(df_post["Year"].max())
+                fig_post = px.line(
+                    agg_post,
+                    x="Hour",
+                    y="Euro per MWh",
+                    color="Season",
+                    markers=True,
+                    color_discrete_sequence=company_colors,
+                    labels={"Hour":"Hour of day", "Euro per MWh":"€/MWh"},
+                    title=f"{selected_country} — Average Intraday Profile by Season ({y_min}–{y_max})"
+                )
+                fig_post.update_layout(margin=dict(l=10, r=10, t=40, b=10), xaxis=dict(dtick=2, range=[0, 23]))
+                st.plotly_chart(fig_post, use_container_width=True)
+
+# -------------------------
+        # Distributions: Pre vs Post (Plotly Express) — 2 columns
+        # -------------------------
+        st. divider()
+
+        st.subheader("Price Distribution — Pre vs Post 2022")
+
+        df_v = df_c.dropna(subset=["Euro per MWh", "LocalDatetime"]).copy()
+        df_v["Period"] = np.where(
+            df_v["LocalDatetime"] < pd.Timestamp("2022-01-01"),
+            "2015–2021",
+            "2022–2025"
+        )
+        season_order = ["Winter", "Spring", "Summer", "Autumn"]
+        df_v["Season"] = pd.Categorical(df_v["Season"], categories=season_order, ordered=True)
+
+        palette_pre_post = [company_colors[4], company_colors[2]]
+
+        import plotly.graph_objects as go
+
+        # Safety: clamp extremes for readability
+        ymax = float(np.nanpercentile(df_v["Euro per MWh"], 99.8))
+
+        pre_color  = company_colors[4]
+        post_color = company_colors[2]
+
+        pre_vals  = df_v.loc[df_v["Period"] == "2015–2021", "Euro per MWh"]
+        post_vals = df_v.loc[df_v["Period"] == "2022–2025", "Euro per MWh"]
+
+        col1, col2 = st.columns([1, 1.8])
+
+        # ----------------------------
+        # --- Column 1: Overlaid density histograms (PX) ---
+        with col1:
+            fig_hist = px.histogram(
+                df_v,
+                x="Euro per MWh",
+                color="Period",
+                nbins=120,
+                histnorm="probability density",   # density like seaborn's stat='density'
+                barmode="overlay",
+                opacity=0.5,
+                category_orders={"Period": ["2015–2021", "2022–2025"]},
+                color_discrete_sequence=palette_pre_post,
+                labels={"Euro per MWh": "€/MWh"},
+                title="Price Distribution — Pre vs Post 2022"
             )
-            fig.update_layout(margin=dict(l=10,r=10,t=10,b=10))
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No data to plot.")
-
-    with right:
-        st.subheader("Yearly Net Profit (€) — Stacked by Scenario")
-
-        yearly_df = build_annual_prorated_net(daily_all, float(opex_year))
-        if not yearly_df.empty:
-            import plotly.express as px
-
-            fig2 = px.bar(
-                yearly_df,
-                x="net",                # horizontal value axis
-                y="year",               # categories on Y
-                color="scenario",       # stack by scenario
-                orientation="h",
-                barmode="group",
-                text_auto= True,
-                color_discrete_sequence=company_colors,
-                labels={"net":"Net Profit (€)", "year":"Year", "scenario":"Scenario"},
-                title=""
+            fig_hist.update_layout(
+                margin=dict(l=10, r=10, t=60, b=10),
+                height=480,
+                title_x=0,                 # center title
+                legend_title_text=""
             )
-            fig2.update_layout(
-                yaxis=dict(type="category"),  # ensure 2019,2020,... not treated as continuous
-                margin=dict(l=10, r=10, t=10, b=10),
-            )
-            st.plotly_chart(fig2, use_container_width=True)
-        else:
-            st.info("No yearly data available for the selected filters.")
+            fig_hist.update_yaxes(title_text="Density")
+
+            # Optional: clamp extreme tails for readability (p99.5)
+            xmax = float(np.nanpercentile(df_v["Euro per MWh"], 99.5))
+            xmin = float(np.nanpercentile(df_v["Euro per MWh"], 0.5))
+            fig_hist.update_xaxes(range=[xmin, xmax])
+
+            # Optional: show median lines per period
+            med_pre  = float(np.nanmedian(df_v.loc[df_v["Period"]=="2015–2021", "Euro per MWh"]))
+            med_post = float(np.nanmedian(df_v.loc[df_v["Period"]=="2022–2025", "Euro per MWh"]))
+            fig_hist.add_vline(x=med_pre,  line_dash="dash", line_width=1, line_color=palette_pre_post[0],
+                            annotation_text="Median 2015–2021", annotation_position="top left")
+            fig_hist.add_vline(x=med_post, line_dash="dash", line_width=1, line_color=palette_pre_post[1],
+                            annotation_text="Median 2022–2025", annotation_position="top right")
+
+            st.plotly_chart(fig_hist, use_container_width=True)
+
+        # -------------------------------
+        # Column 2 — By Season (split violins per category)
+        # -------------------------------
+            with col2:
+                import plotly.graph_objects as go
+
+                # if you don't already have these defined above:
+                # pre_color  = company_colors[4]
+                # post_color = company_colors[2]
+                # ymax = float(np.nanpercentile(df_v["Euro per MWh"], 99.5))
+
+                fig_season = go.Figure()
+
+                legend_pre_shown = False
+                legend_post_shown = False
+
+                for season in season_order:
+                    # Pre
+                    vals_pre = df_v.loc[
+                        (df_v["Season"] == season) & (df_v["Period"] == "2015–2021"),
+                        "Euro per MWh"
+                    ]
+                    if len(vals_pre):
+                        fig_season.add_trace(go.Violin(
+                            x=[season] * len(vals_pre),
+                            y=vals_pre,
+                            name="2015–2021",
+                            legendgroup="pre",
+                            scalegroup="all",
+                            side="negative",
+                            line_color=pre_color,
+                            meanline_visible=True,
+                            points=False,
+                            jitter=0.05,
+                            scalemode="count",
+                            width=1,
+                            spanmode="soft",
+                            showlegend=(not legend_pre_shown)   # show once
+                        ))
+                        legend_pre_shown = True
+
+                    # Post
+                    vals_post = df_v.loc[
+                        (df_v["Season"] == season) & (df_v["Period"] == "2022–2025"),
+                        "Euro per MWh"
+                    ]
+                    if len(vals_post):
+                        fig_season.add_trace(go.Violin(
+                            x=[season] * len(vals_post),
+                            y=vals_post,
+                            name="2022–2025",
+                            legendgroup="post",
+                            scalegroup="all",
+                            side="positive",
+                            line_color=post_color,
+                            meanline_visible=True,
+                            points=False,
+                            jitter=0.05,
+                            scalemode="count",
+                            width=0.9,
+                            spanmode="soft",
+                            showlegend=(not legend_post_shown)  # show once
+                        ))
+                        legend_post_shown = True
+
+                fig_season.update_layout(
+                    title="Violin Plots — Pre vs Post 2022 by Season",
+                    title_x=0,
+                    violingap=0.01,
+                    violingroupgap=0.10,
+                    violinmode="overlay",
+                    margin=dict(l=10, r=10, t=60, b=10),
+                    height=480,
+                    legend_title_text="",        # legend visible here
+                    showlegend=True
+                )
+                fig_season.update_yaxes(range=[0, ymax], title_text="€/MWh")
+                fig_season.update_xaxes(title_text="Season")
+
+                st.plotly_chart(fig_season, use_container_width=True)
 
 
-elif run_btn:
-    st.info("No results to display. Check data filters and try again.")
+
+
+        st. divider()
+        st.subheader("Intraday Price Profiles by Season — Yearly Lines + Pre/Post Averages")
+
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import to_rgb
+
+        def lighten(hex_color: str, amount: float = 0.6):
+            r, g, b = to_rgb(hex_color)
+            return (r + (1 - r) * amount, g + (1 - g) * amount, b + (1 - b) * amount)
+
+        def pick_years(yrs, k=3):
+            """Pick first k and last k years from an array-like."""
+            yrs = sorted(set(int(y) for y in yrs))
+            if len(yrs) <= 2*k:
+                return yrs
+            return yrs[:k] + yrs[-k:]
+
+        df_plot = df_c.set_index("LocalDatetime").copy()
+        seasons = ["Winter", "Spring", "Summer", "Autumn"]
+
+        PRE_COLOR  = company_colors[4]  # 2015–2021 avg
+        POST_COLOR = company_colors[2]  # 2022–2025 avg
+        PRE_LIGHT  = lighten(PRE_COLOR, 0.4)
+        POST_LIGHT = lighten(POST_COLOR, 0.4)
+
+        fig, axes = plt.subplots(2, 2, figsize=(10, 7), sharex=False, sharey=False)
+        fig.patch.set_alpha(0.0)
+        for ax in axes.flat:
+            ax.set_facecolor("none")
+
+        for ax, season in zip(axes.flat, seasons):
+            grp_pre  = df_plot.loc[(df_plot.index < "2022-01-01") & (df_plot["Season"] == season)]
+            grp_post = df_plot.loc[(df_plot.index >= "2022-01-01") & (df_plot["Season"] == season)]
+
+            # Years to annotate
+            years_pre  = pick_years(grp_pre["Year"].unique(), k=4)
+            years_post = pick_years(grp_post["Year"].unique(), k=2)
+
+            # --- Yearly PRE ---
+            for year, grp in grp_pre.groupby("Year"):
+                curve = grp.groupby("Hour")["Euro per MWh"].mean()
+                if curve.empty: continue
+                ax.plot(curve.index, curve.values, color=PRE_LIGHT, lw=0.5, ls="--", label="_nolegend_")
+                if int(year) in years_pre:
+                    x_last = int(curve.index.max())
+                    y_last = float(curve.loc[x_last])
+                    ax.annotate(
+                        str(int(year)),
+                        xy=(x_last, y_last),
+                        xytext=(6, 0),
+                        textcoords="offset points",
+                        ha="left", va="center",
+                        fontsize=6, color=PRE_LIGHT
+                    )
+
+            # --- Yearly POST ---
+            for year, grp in grp_post.groupby("Year"):
+                curve = grp.groupby("Hour")["Euro per MWh"].mean()
+                if curve.empty: continue
+                ax.plot(curve.index, curve.values, color=POST_LIGHT, lw=0.5,  ls="--", label="_nolegend_")
+                if int(year) in years_post:
+                    x_last = int(curve.index.max())
+                    y_last = float(curve.loc[x_last])
+                    ax.annotate(
+                        str(int(year)),
+                        xy=(x_last, y_last),
