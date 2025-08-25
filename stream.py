@@ -1615,3 +1615,37 @@ with tab2:
                     ax.annotate(
                         str(int(year)),
                         xy=(x_last, y_last),
+                        xytext=(6, 0),
+                        textcoords="offset points",
+                        ha="left", va="center",
+                        fontsize=6, color=POST_LIGHT,
+                    )
+
+            # --- Bold averages ---
+            pre_avg  = grp_pre.groupby("Hour")["Euro per MWh"].mean()
+            post_avg = grp_post.groupby("Hour")["Euro per MWh"].mean()
+            if not pre_avg.empty:
+                ax.plot(pre_avg.index, pre_avg.values, marker="s", lw=2,markersize = 3.5, color=PRE_COLOR, label="2015–2021 avg")
+            if not post_avg.empty:
+                ax.plot(post_avg.index, post_avg.values, marker="s",markersize = 3.5, lw=2, color=POST_COLOR, label="2022–2025 avg")
+
+
+            for spine in ax.spines.values():
+                spine.set_visible(False)
+            ax.set_xlim(-0.5, 26)   # extra space for labels
+            ax.grid(True, alpha=0.10)
+            ax.set_title(season, fontsize=7)
+            ax.set_xlabel("Hour of Day", fontsize=6)
+            ax.set_ylabel("€/MWh", fontsize=6)
+            ax.tick_params(labelsize=6)
+        # global legend
+        handles, labels = axes[0, 0].get_legend_handles_labels()
+        by_label = {lbl: h for h, lbl in zip(handles, labels) if lbl != "_nolegend_"}
+        fig.legend(
+            by_label.values(), by_label.keys(),
+            loc="upper center", ncol=2, bbox_to_anchor=(0.5, 0.99), fontsize=6
+)
+        plt.tight_layout(rect=[0, 0.05, 1, 0.95])
+
+
+        st.pyplot(fig)
