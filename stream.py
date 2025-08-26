@@ -20,7 +20,7 @@ import plotly.graph_objects as go
 # PAGE + THEME (Streamlit shell + CSS)
 # ---------------------------------------------
 st.set_page_config(
-    page_title="Battery Arbitrage Dashboard",
+    page_title="Energy Arbitrage Dashboard",
     page_icon="⚡",
     layout="wide",
 )
@@ -1017,7 +1017,7 @@ with tab1:
                 yearly_df["scenario"] = yearly_df["scenario"].replace({"12c-12d": "12c-12d (Naive)"})
 
                 # Round NET to 2 decimals for plotting & labels
-                yearly_df["net"] = yearly_df["net"].astype(float).round(2)
+                yearly_df["net"] = yearly_df["net"].astype(float).round(0)
 
                 fig2 = px.bar(
                     yearly_df,
