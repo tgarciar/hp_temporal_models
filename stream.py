@@ -1039,10 +1039,10 @@ with tab1:
 
                 # Format bar labels to € and 2 decimals; nicer hover; axis ticks to 2 decimals + €
                 fig2.update_traces(
-                    texttemplate="€ %{x:,.2f}",
+                    texttemplate="€ %{x:,.0f}",
                     textposition="outside",
                     hovertemplate="<b>Year:</b> %{y}<br><b>Scenario:</b> %{fullData.name}"
-                                "<br><b>Net:</b> € %{x:,.2f}<extra></extra>"
+                                "<br><b>Net:</b> € %{x:,.0f}<extra></extra>"
                 )
 
                 # Let text hang outside the bars without being clipped
