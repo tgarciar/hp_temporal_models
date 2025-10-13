@@ -112,7 +112,7 @@ def load_prices() -> pd.DataFrame:
     df = pd.read_parquet("bidding_zone_prices.parquet")
     df = df[['LocalDatetime','Euro per MWh','Country']]
     df["LocalDatetime"] = pd.to_datetime(df["LocalDatetime"])
-    df = df[(df["LocalDatetime"] >= "2023-01-01 00:00:00") &
+    df = df[(df["LocalDatetime"] >= "2022-01-01 00:00:00") &
             (df["LocalDatetime"] <= CUTOFF_END)]
     # Optional keep-list of countries
     keep = ["ES", "FI", "NL", "DE", "FR", "DE-LU"]
@@ -1212,7 +1212,7 @@ with tab1:
 
         df_heat = prices_df.copy()
         df_heat = df_heat[(df_heat["Country"] == country) &
-                        (df_heat["LocalDatetime"] >= pd.Timestamp("2022-01-01"))]
+                        (df_heat["LocalDatetime"] >= pd.Timestamp("2023-01-01"))]
         if date_end is not None:
             df_heat = df_heat[df_heat["LocalDatetime"] <= pd.to_datetime(date_end)]
 
@@ -1271,7 +1271,7 @@ with tab1:
             zmin=-vmax, zmax=vmax,         # center around 0
             aspect="auto",
             labels=dict(color="€/MWh vs monthly avg", x="Hour of day", y="Month–Year"),
-            title=f"{country} — Intraday Price Deviation from Monthly Average (2022–{int(df_heat['LocalDatetime'].dt.year.max())})"
+            title=f"{country} — Intraday Price Deviation from Monthly Average (January 2023 – August 2025)"
         )
 
         # --- Annotations (numbers in each cell) ---
