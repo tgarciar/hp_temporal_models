@@ -1208,7 +1208,7 @@ with tab1:
         # Tab 1 — Intraday deviation heatmap (PX, PeriodIndex-safe)
         # ---------------------------------------------
         st.divider()
-        st.subheader("Intraday Price Deviation from Monthly Average (2022–present)")
+        st.subheader("Intraday Price Deviation from Monthly Average (January 2023 – August 2025)")
 
         df_heat = prices_df.copy()
         df_heat = df_heat[(df_heat["Country"] == country) &
