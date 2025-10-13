@@ -112,7 +112,7 @@ def load_prices() -> pd.DataFrame:
     df = pd.read_parquet("bidding_zone_prices.parquet")
     df = df[['LocalDatetime','Euro per MWh','Country']]
     df["LocalDatetime"] = pd.to_datetime(df["LocalDatetime"])
-    df = df[(df["LocalDatetime"] >= "2022-01-01 00:00:00") &
+    df = df[(df["LocalDatetime"] >= "2023-01-01 00:00:00") &
             (df["LocalDatetime"] <= CUTOFF_END)]
     # Optional keep-list of countries
     keep = ["ES", "FI", "NL", "DE", "FR", "DE-LU"]
